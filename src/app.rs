@@ -163,6 +163,48 @@ struct OpenRouterRateLimit {
     interval: Option<String>,
 }
 
+// Claude local stats cache structures
+#[derive(Debug, Deserialize)]
+struct ClaudeStatsCache {
+    #[serde(rename = "dailyModelTokens")]
+    daily_model_tokens: Option<Vec<DailyModelTokens>>,
+    #[serde(rename = "modelUsage")]
+    model_usage: Option<std::collections::HashMap<String, ModelUsage>>,
+    #[serde(rename = "totalSessions")]
+    total_sessions: Option<u32>,
+    #[serde(rename = "totalMessages")]
+    total_messages: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DailyModelTokens {
+    date: String,
+    #[serde(rename = "tokensByModel")]
+    tokens_by_model: std::collections::HashMap<String, u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelUsage {
+    #[serde(rename = "inputTokens")]
+    input_tokens: Option<u64>,
+    #[serde(rename = "outputTokens")]
+    output_tokens: Option<u64>,
+    #[serde(rename = "cacheReadInputTokens")]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(rename = "cacheCreationInputTokens")]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(rename = "costUSD")]
+    cost_usd: Option<f64>,
+}
+
+// Copilot session event structures
+#[derive(Debug, Deserialize)]
+struct CopilotEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    data: Option<serde_json::Value>,
+}
+
 fn default_poll_seconds() -> u64 {
     DEFAULT_POLL_SECONDS
 }
@@ -543,6 +585,7 @@ async fn collect_agent_status(def: &AgentDefinition, config: &Config) -> AgentSt
         "gemini" => collect_gemini(&mut status).await,
         "copilot" => collect_copilot(&mut status).await,
         "openrouter" => collect_openrouter(&mut status, config).await,
+        "opencode" | "opencode-zai" => collect_opencode(&mut status, &def.id).await,
         _ => {
             status.state = AgentState::Installed;
             status.summary = format!("{} installed", def.command);
@@ -566,6 +609,12 @@ async fn command_exists(cmd: &str) -> bool {
 async fn collect_claude(status: &mut AgentStatus, _config: &Config) {
     let home = dirs::home_dir().unwrap_or_default();
     let creds_path = home.join(".claude/.credentials.json");
+    let stats_path = home.join(".claude/stats-cache.json");
+
+    // Read local stats first (always available if Claude has been used)
+    let local_stats: Option<ClaudeStatsCache> = fs::read_to_string(&stats_path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok());
 
     let token = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").ok().or_else(|| {
         let content = fs::read_to_string(&creds_path).ok()?;
@@ -574,8 +623,15 @@ async fn collect_claude(status: &mut AgentStatus, _config: &Config) {
     });
 
     let Some(token) = token else {
-        status.state = AgentState::Warning;
-        status.summary = "Claude installed but no OAuth token found".to_string();
+        // Even without API access, show local stats if available
+        if let Some(stats) = local_stats {
+            status.state = AgentState::Warning;
+            status.summary = "No OAuth token - showing local stats".to_string();
+            add_claude_local_stats(status, &stats);
+        } else {
+            status.state = AgentState::Warning;
+            status.summary = "Claude installed but no OAuth token found".to_string();
+        }
         return;
     };
 
@@ -597,6 +653,9 @@ async fn collect_claude(status: &mut AgentStatus, _config: &Config) {
     let Ok(resp) = response else {
         status.state = AgentState::Warning;
         status.summary = "Claude token found but usage API unreachable".to_string();
+        if let Some(stats) = local_stats {
+            add_claude_local_stats(status, &stats);
+        }
         return;
     };
 
@@ -604,18 +663,27 @@ async fn collect_claude(status: &mut AgentStatus, _config: &Config) {
     if resp.status() == 429 {
         status.state = AgentState::Ready;
         status.summary = "Rate limited - try again later".to_string();
+        if let Some(stats) = local_stats {
+            add_claude_local_stats(status, &stats);
+        }
         return;
     }
 
     if !resp.status().is_success() {
         status.state = AgentState::Warning;
         status.summary = format!("API error: {}", resp.status());
+        if let Some(stats) = local_stats {
+            add_claude_local_stats(status, &stats);
+        }
         return;
     }
 
     let Ok(usage) = resp.json::<ClaudeUsageResponse>().await else {
         status.state = AgentState::Warning;
         status.summary = "Failed to parse usage response".to_string();
+        if let Some(stats) = local_stats {
+            add_claude_local_stats(status, &stats);
+        }
         return;
     };
 
@@ -653,6 +721,41 @@ async fn collect_claude(status: &mut AgentStatus, _config: &Config) {
 
     status.metrics.current_utilization = Some(current_pct);
     status.metrics.weekly_utilization = Some(weekly_pct);
+
+    // Add local stats as additional details
+    if let Some(stats) = local_stats {
+        add_claude_local_stats(status, &stats);
+    }
+}
+
+fn add_claude_local_stats(status: &mut AgentStatus, stats: &ClaudeStatsCache) {
+    // Total tokens across all models
+    if let Some(model_usage) = &stats.model_usage {
+        let total_input: u64 = model_usage.values()
+            .filter_map(|m| m.input_tokens)
+            .sum();
+        let total_output: u64 = model_usage.values()
+            .filter_map(|m| m.output_tokens)
+            .sum();
+        let total_cache_read: u64 = model_usage.values()
+            .filter_map(|m| m.cache_read_input_tokens)
+            .sum();
+
+        if total_input > 0 || total_output > 0 {
+            status.details.push(format!(
+                "Local: {}K in / {}K out",
+                total_input / 1000,
+                total_output / 1000
+            ));
+        }
+        if total_cache_read > 0 {
+            status.details.push(format!("Cache reads: {}M tokens", total_cache_read / 1_000_000));
+        }
+    }
+
+    if let (Some(sessions), Some(messages)) = (stats.total_sessions, stats.total_messages) {
+        status.details.push(format!("Sessions: {sessions} | Messages: {messages}"));
+    }
 }
 
 async fn collect_codex(status: &mut AgentStatus) {
@@ -679,27 +782,85 @@ async fn collect_codex(status: &mut AgentStatus) {
         _ => "Unable to read login status".to_string(),
     };
 
-    // Count threads from SQLite
+    // Query SQLite for usage stats
     let state_db = codex_dir.join("state_5.sqlite");
-    let thread_count = if state_db.exists() {
-        rusqlite::Connection::open(&state_db)
-            .and_then(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get::<_, i64>(0))
-            })
-            .ok()
-    } else {
-        None
-    };
+    let mut thread_count: Option<i64> = None;
+    let mut total_tokens: Option<i64> = None;
+    let mut today_tokens: Option<i64> = None;
+    let mut week_tokens: Option<i64> = None;
+
+    if state_db.exists() {
+        if let Ok(conn) = rusqlite::Connection::open(&state_db) {
+            // Total thread count
+            thread_count = conn
+                .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get::<_, i64>(0))
+                .ok();
+
+            // Total tokens across all time
+            total_tokens = conn
+                .query_row("SELECT SUM(tokens_used) FROM threads", [], |row| row.get::<_, i64>(0))
+                .ok();
+
+            // Tokens from last 24 hours (timestamps are in milliseconds)
+            let day_ago_ms = (chrono::Utc::now().timestamp() - 86400) * 1000;
+            today_tokens = conn
+                .query_row(
+                    "SELECT SUM(tokens_used) FROM threads WHERE updated_at > ?1",
+                    [day_ago_ms],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok();
+
+            // Tokens from last 7 days
+            let week_ago_ms = (chrono::Utc::now().timestamp() - 7 * 86400) * 1000;
+            week_tokens = conn
+                .query_row(
+                    "SELECT SUM(tokens_used) FROM threads WHERE updated_at > ?1",
+                    [week_ago_ms],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok();
+        }
+    }
 
     status.state = if summary.to_lowercase().contains("logged in") {
         AgentState::Ready
     } else {
         AgentState::Warning
     };
-    status.summary = summary;
+
+    // Build enhanced summary with token counts
+    if let Some(week) = week_tokens {
+        if week > 0 {
+            // Estimate cost at ~$0.01 per 1K tokens (rough average for GPT-4o)
+            let estimated_cost = week as f64 / 1000.0 * 0.01;
+            status.summary = format!(
+                "{} | ~{}K tokens/week (~${:.2})",
+                if summary.to_lowercase().contains("logged in") { "Logged in" } else { &summary },
+                week / 1000,
+                estimated_cost
+            );
+        } else {
+            status.summary = summary;
+        }
+    } else {
+        status.summary = summary;
+    }
 
     if let Some(count) = thread_count {
-        status.details.push(format!("Local sessions: {count}"));
+        status.details.push(format!("Sessions: {count}"));
+    }
+
+    if let Some(today) = today_tokens {
+        if today > 0 {
+            status.details.push(format!("Today: {}K tokens", today / 1000));
+        }
+    }
+
+    if let Some(total) = total_tokens {
+        if total > 0 {
+            status.details.push(format!("All time: {}K tokens", total / 1000));
+        }
     }
 }
 
@@ -740,14 +901,44 @@ async fn collect_copilot(status: &mut AgentStatus) {
         .and_then(|v| v.get("last_logged_in_user")?.as_str().map(String::from));
 
     let session_dir = copilot_dir.join("session-state");
-    let session_count = fs::read_dir(&session_dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|e| e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0);
+
+    // Parse session files for detailed stats
+    let mut session_count = 0;
+    let mut total_messages = 0;
+    let mut max_tokens_in_session = 0u64;
+
+    if let Ok(entries) = fs::read_dir(&session_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().map(|ext| ext == "jsonl").unwrap_or(false) {
+                session_count += 1;
+
+                // Parse JSONL to get token counts
+                if let Ok(content) = fs::read_to_string(&path) {
+                    for line in content.lines() {
+                        if let Ok(event) = serde_json::from_str::<CopilotEvent>(line) {
+                            match event.event_type.as_str() {
+                                "user.message" => total_messages += 1,
+                                "session.truncation" => {
+                                    // Extract token count from truncation event
+                                    if let Some(data) = &event.data {
+                                        if let Some(tokens) = data.get("preTruncationTokensInMessages")
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            if tokens > max_tokens_in_session {
+                                                max_tokens_in_session = tokens;
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     status.state = if user.is_some() {
         AgentState::Ready
@@ -755,16 +946,29 @@ async fn collect_copilot(status: &mut AgentStatus) {
         AgentState::Installed
     };
 
-    status.summary = format!(
-        "{} | {} sessions",
-        if user.is_some() { "Signed in" } else { "Installed" },
-        session_count
-    );
+    // Build summary with token info
+    if max_tokens_in_session > 0 {
+        status.summary = format!(
+            "{} | {}K tokens max",
+            if user.is_some() { "Signed in" } else { "Installed" },
+            max_tokens_in_session / 1000
+        );
+    } else {
+        status.summary = format!(
+            "{} | {} sessions",
+            if user.is_some() { "Signed in" } else { "Installed" },
+            session_count
+        );
+    }
 
     if let Some(u) = user {
-        status.details.push(format!("Last user: {u}"));
+        status.details.push(format!("User: {u}"));
     }
-    status.details.push(format!("Local sessions: {session_count}"));
+    status.details.push(format!("Sessions: {session_count} | Messages: {total_messages}"));
+
+    if max_tokens_in_session > 0 {
+        status.details.push(format!("Peak context: {}K tokens", max_tokens_in_session / 1000));
+    }
 }
 
 async fn collect_openrouter(status: &mut AgentStatus, config: &Config) {
@@ -836,5 +1040,74 @@ async fn collect_openrouter(status: &mut AgentStatus, config: &Config) {
                 status.details.push(format!("Rate limit: {} req/{}", requests, interval));
             }
         }
+    }
+}
+
+async fn collect_opencode(status: &mut AgentStatus, agent_id: &str) {
+    let home = dirs::home_dir().unwrap_or_default();
+    let opencode_dir = home.join(".local/share/opencode");
+    let db_path = opencode_dir.join("opencode-stable.db");
+    let auth_path = opencode_dir.join("auth.json");
+
+    // Check authentication status
+    let authenticated = fs::read_to_string(&auth_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .map(|v| v.get("token").is_some() || v.get("access_token").is_some())
+        .unwrap_or(false);
+
+    let mut session_count: Option<i64> = None;
+    let mut project_count: Option<i64> = None;
+    let mut message_count: Option<i64> = None;
+
+    if db_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            session_count = conn
+                .query_row("SELECT COUNT(*) FROM session", [], |row| row.get::<_, i64>(0))
+                .ok();
+
+            project_count = conn
+                .query_row("SELECT COUNT(*) FROM project", [], |row| row.get::<_, i64>(0))
+                .ok();
+
+            message_count = conn
+                .query_row("SELECT COUNT(*) FROM message", [], |row| row.get::<_, i64>(0))
+                .ok();
+        }
+    }
+
+    let variant = if agent_id == "opencode-zai" { "Z.ai" } else { "Zen" };
+
+    status.state = if authenticated || session_count.unwrap_or(0) > 0 {
+        AgentState::Ready
+    } else {
+        AgentState::Installed
+    };
+
+    // Build summary
+    if let Some(sessions) = session_count {
+        if sessions > 0 {
+            status.summary = format!("OpenCode {} | {} sessions", variant, sessions);
+        } else {
+            status.summary = format!("OpenCode {} installed", variant);
+        }
+    } else {
+        status.summary = format!("OpenCode {} installed", variant);
+    }
+
+    if let Some(projects) = project_count {
+        if projects > 0 {
+            status.details.push(format!("Projects: {projects}"));
+        }
+    }
+
+    if let Some(messages) = message_count {
+        if messages > 0 {
+            status.details.push(format!("Messages: {messages}"));
+        }
+    }
+
+    if authenticated {
+        status.details.push("Authenticated".to_string());
     }
 }
