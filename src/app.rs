@@ -729,7 +729,13 @@ async fn collect_claude(status: &mut AgentStatus, _config: &Config) {
 }
 
 fn add_claude_local_stats(status: &mut AgentStatus, stats: &ClaudeStatsCache) {
-    // Total tokens across all models
+    // Claude Opus 4.5 pricing (per million tokens):
+    // Input: $15, Output: $75, Cache write: $18.75, Cache read: $1.50
+    const INPUT_COST_PER_M: f64 = 15.0;
+    const OUTPUT_COST_PER_M: f64 = 75.0;
+    const CACHE_WRITE_COST_PER_M: f64 = 18.75;
+    const CACHE_READ_COST_PER_M: f64 = 1.50;
+
     if let Some(model_usage) = &stats.model_usage {
         let total_input: u64 = model_usage.values()
             .filter_map(|m| m.input_tokens)
@@ -740,16 +746,34 @@ fn add_claude_local_stats(status: &mut AgentStatus, stats: &ClaudeStatsCache) {
         let total_cache_read: u64 = model_usage.values()
             .filter_map(|m| m.cache_read_input_tokens)
             .sum();
+        let total_cache_write: u64 = model_usage.values()
+            .filter_map(|m| m.cache_creation_input_tokens)
+            .sum();
+
+        // Calculate estimated cost
+        let input_cost = total_input as f64 / 1_000_000.0 * INPUT_COST_PER_M;
+        let output_cost = total_output as f64 / 1_000_000.0 * OUTPUT_COST_PER_M;
+        let cache_read_cost = total_cache_read as f64 / 1_000_000.0 * CACHE_READ_COST_PER_M;
+        let cache_write_cost = total_cache_write as f64 / 1_000_000.0 * CACHE_WRITE_COST_PER_M;
+        let total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
+
+        if total_cost > 0.0 {
+            status.details.push(format!("Est. cost: ~${:.2}", total_cost));
+        }
 
         if total_input > 0 || total_output > 0 {
             status.details.push(format!(
-                "Local: {}K in / {}K out",
+                "Tokens: {}K in / {}K out",
                 total_input / 1000,
                 total_output / 1000
             ));
         }
-        if total_cache_read > 0 {
-            status.details.push(format!("Cache reads: {}M tokens", total_cache_read / 1_000_000));
+        if total_cache_read > 0 || total_cache_write > 0 {
+            status.details.push(format!(
+                "Cache: {}M read / {}M write",
+                total_cache_read / 1_000_000,
+                total_cache_write / 1_000_000
+            ));
         }
     }
 
@@ -801,22 +825,22 @@ async fn collect_codex(status: &mut AgentStatus) {
                 .query_row("SELECT SUM(tokens_used) FROM threads", [], |row| row.get::<_, i64>(0))
                 .ok();
 
-            // Tokens from last 24 hours (timestamps are in milliseconds)
-            let day_ago_ms = (chrono::Utc::now().timestamp() - 86400) * 1000;
+            // Tokens from last 24 hours (timestamps are in seconds)
+            let day_ago = chrono::Utc::now().timestamp() - 86400;
             today_tokens = conn
                 .query_row(
                     "SELECT SUM(tokens_used) FROM threads WHERE updated_at > ?1",
-                    [day_ago_ms],
+                    [day_ago],
                     |row| row.get::<_, i64>(0),
                 )
                 .ok();
 
             // Tokens from last 7 days
-            let week_ago_ms = (chrono::Utc::now().timestamp() - 7 * 86400) * 1000;
+            let week_ago = chrono::Utc::now().timestamp() - 7 * 86400;
             week_tokens = conn
                 .query_row(
                     "SELECT SUM(tokens_used) FROM threads WHERE updated_at > ?1",
-                    [week_ago_ms],
+                    [week_ago],
                     |row| row.get::<_, i64>(0),
                 )
                 .ok();
@@ -829,37 +853,46 @@ async fn collect_codex(status: &mut AgentStatus) {
         AgentState::Warning
     };
 
-    // Build enhanced summary with token counts
-    if let Some(week) = week_tokens {
-        if week > 0 {
-            // Estimate cost at ~$0.01 per 1K tokens (rough average for GPT-4o)
-            let estimated_cost = week as f64 / 1000.0 * 0.01;
-            status.summary = format!(
-                "{} | ~{}K tokens/week (~${:.2})",
-                if summary.to_lowercase().contains("logged in") { "Logged in" } else { &summary },
-                week / 1000,
-                estimated_cost
-            );
-        } else {
-            status.summary = summary;
-        }
+    // Calculate costs - GPT-4o pricing: $2.50/1M input, $10/1M output
+    // Estimate 1:4 input:output ratio, so ~$8.50/1M tokens average
+    let cost_per_million = 8.50;
+
+    // Build enhanced summary with cost estimate
+    let total = total_tokens.unwrap_or(0);
+    if total > 0 {
+        let total_cost = total as f64 / 1_000_000.0 * cost_per_million;
+        let logged_in = summary.to_lowercase().contains("logged in");
+        status.summary = format!(
+            "{} | ~${:.2} total",
+            if logged_in { "Logged in" } else { &summary },
+            total_cost
+        );
     } else {
         status.summary = summary;
     }
 
+    // Show detailed breakdown
     if let Some(count) = thread_count {
         status.details.push(format!("Sessions: {count}"));
     }
 
     if let Some(today) = today_tokens {
         if today > 0 {
-            status.details.push(format!("Today: {}K tokens", today / 1000));
+            let today_cost = today as f64 / 1_000_000.0 * cost_per_million;
+            status.details.push(format!("Today: {}K tokens (~${:.2})", today / 1000, today_cost));
+        }
+    }
+
+    if let Some(week) = week_tokens {
+        if week > 0 {
+            let week_cost = week as f64 / 1_000_000.0 * cost_per_million;
+            status.details.push(format!("This week: {}K tokens (~${:.2})", week / 1000, week_cost));
         }
     }
 
     if let Some(total) = total_tokens {
         if total > 0 {
-            status.details.push(format!("All time: {}K tokens", total / 1000));
+            status.details.push(format!("All time: {}M tokens", total / 1_000_000));
         }
     }
 }
@@ -946,29 +979,25 @@ async fn collect_copilot(status: &mut AgentStatus) {
         AgentState::Installed
     };
 
-    // Build summary with token info
-    if max_tokens_in_session > 0 {
-        status.summary = format!(
-            "{} | {}K tokens max",
-            if user.is_some() { "Signed in" } else { "Installed" },
-            max_tokens_in_session / 1000
-        );
-    } else {
-        status.summary = format!(
-            "{} | {} sessions",
-            if user.is_some() { "Signed in" } else { "Installed" },
-            session_count
-        );
-    }
+    // Copilot Pro is $10/month unlimited, so just show usage stats
+    // Build summary with session info
+    status.summary = format!(
+        "{} | {} sessions",
+        if user.is_some() { "Signed in" } else { "Installed" },
+        session_count
+    );
 
     if let Some(u) = user {
         status.details.push(format!("User: {u}"));
     }
-    status.details.push(format!("Sessions: {session_count} | Messages: {total_messages}"));
+    status.details.push(format!("Messages: {total_messages}"));
 
     if max_tokens_in_session > 0 {
         status.details.push(format!("Peak context: {}K tokens", max_tokens_in_session / 1000));
     }
+
+    // Copilot Pro is flat rate, note that
+    status.details.push("Plan: $10/mo unlimited".to_string());
 }
 
 async fn collect_openrouter(status: &mut AgentStatus, config: &Config) {
