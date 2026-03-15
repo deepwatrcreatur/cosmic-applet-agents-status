@@ -36,6 +36,7 @@ pub enum Message {
     PopupClosed(Id),
     Refresh,
     Refreshed(Result<AgentsSnapshot, String>),
+    OpenDashboard(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +63,8 @@ struct AgentDefinition {
     id: String,
     name: String,
     command: String,
+    #[serde(default)]
+    dashboard_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +85,8 @@ struct AgentStatus {
     details: Vec<String>,
     #[serde(default)]
     metrics: AgentMetrics,
+    #[serde(default)]
+    dashboard_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +248,12 @@ impl cosmic::Application for AgentsApplet {
                     self.state.snapshot = None;
                 }
             },
+            Message::OpenDashboard(url) => {
+                // Open URL in default browser
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&url)
+                    .spawn();
+            }
         }
 
         Task::none()
@@ -326,14 +337,33 @@ impl cosmic::Application for AgentsApplet {
                     AgentState::Unknown => "dialog-question-symbolic",
                 };
 
-                content = content.push(
-                    row![
-                        icon::from_name(state_icon).size(14),
-                        text(&agent.name).size(15),
+                // Agent name row with optional dashboard link
+                let name_row = row![
+                    icon::from_name(state_icon).size(14),
+                    text(&agent.name).size(15),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center);
+
+                if let Some(url) = &agent.dashboard_url {
+                    let agent_row = row![
+                        name_row,
+                        container(icon::from_name("emblem-web-symbolic").size(12))
+                            .padding([0, 4]),
                     ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                );
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fill);
+
+                    content = content.push(
+                        button::custom(agent_row)
+                            .on_press(Message::OpenDashboard(url.clone()))
+                            .padding([4, 8])
+                            .class(cosmic::theme::Button::Text),
+                    );
+                } else {
+                    content = content.push(name_row);
+                }
 
                 content = content.push(text(&agent.summary).size(13));
 
@@ -475,6 +505,19 @@ fn build_label(agents: &[AgentStatus]) -> String {
 async fn collect_agent_status(def: &AgentDefinition, config: &Config) -> AgentStatus {
     let installed = command_exists(&def.command).await;
 
+    // Get dashboard URL from config or use default
+    let dashboard_url = def.dashboard_url.clone().or_else(|| {
+        match def.id.as_str() {
+            "claude" => Some("https://console.anthropic.com/settings/plans".to_string()),
+            "codex" => Some("https://platform.openai.com/usage".to_string()),
+            "gemini" => Some("https://aistudio.google.com/".to_string()),
+            "copilot" => Some("https://github.com/settings/copilot".to_string()),
+            "openrouter" => Some("https://openrouter.ai/credits".to_string()),
+            "opencode" | "opencode-zai" => Some("https://openrouter.ai/credits".to_string()),
+            _ => None,
+        }
+    });
+
     let mut status = AgentStatus {
         id: def.id.clone(),
         name: def.name.clone(),
@@ -484,6 +527,7 @@ async fn collect_agent_status(def: &AgentDefinition, config: &Config) -> AgentSt
         summary: "No status available".to_string(),
         details: vec![],
         metrics: AgentMetrics::default(),
+        dashboard_url,
     };
 
     if !installed {
