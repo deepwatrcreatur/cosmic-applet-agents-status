@@ -147,13 +147,14 @@ struct OpenRouterKeyData {
     label: Option<String>,
     usage: Option<f64>,
     limit: Option<f64>,
+    limit_remaining: Option<f64>,
     is_free_tier: Option<bool>,
     rate_limit: Option<OpenRouterRateLimit>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterRateLimit {
-    requests: Option<u32>,
+    requests: Option<i32>,  // Can be -1 for unlimited
     interval: Option<String>,
 }
 
@@ -771,27 +772,25 @@ async fn collect_openrouter(status: &mut AgentStatus, config: &Config) {
     let data = &key_info.data;
     let usage = data.usage.unwrap_or(0.0);
     let limit = data.limit.unwrap_or(0.0);
+    let remaining = data.limit_remaining.unwrap_or(limit - usage);
 
     status.state = AgentState::Ready;
 
     if limit > 0.0 {
-        let remaining = limit - usage;
         let pct_used = (usage / limit * 100.0).round() as u32;
-        status.summary = format!("${:.2} used / ${:.2} limit ({pct_used}%)", usage, limit);
-        status.details.push(format!("Remaining: ${:.2}", remaining));
+        status.summary = format!("${:.2} remaining ({pct_used}% used)", remaining);
+        status.details.push(format!("Used: ${:.2} / ${:.2}", usage, limit));
     } else if data.is_free_tier.unwrap_or(false) {
         status.summary = format!("Free tier - ${:.4} used", usage);
     } else {
         status.summary = format!("${:.2} used (no limit)", usage);
     }
 
-    if let Some(label) = &data.label {
-        status.details.push(format!("Key: {label}"));
-    }
-
     if let Some(rate_limit) = &data.rate_limit {
         if let (Some(requests), Some(interval)) = (rate_limit.requests, &rate_limit.interval) {
-            status.details.push(format!("Rate limit: {requests} req/{interval}"));
+            if requests > 0 {
+                status.details.push(format!("Rate limit: {} req/{}", requests, interval));
+            }
         }
     }
 }
