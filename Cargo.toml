@@ -1,0 +1,28 @@
+[package]
+name = "cosmic-applet-agents-status"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "COSMIC applet for monitoring coding agent status"
+repository = "https://github.com/deepwatrcreatur/cosmic-applet-agents-status"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "5.0"
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+  "applet",
+  "tokio",
+  "wayland",
+  "desktop-systemd-scope",
+  "winit",
+] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["rt", "time", "process"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

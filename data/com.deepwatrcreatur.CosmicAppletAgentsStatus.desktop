@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Agents Status
+Type=Application
+Exec=cosmic-applet-agents-status
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;AI;Agents;Claude;Codex;
+Icon=utilities-terminal-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=10
