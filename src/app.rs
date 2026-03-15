@@ -53,6 +53,8 @@ struct Config {
     poll_seconds: u64,
     #[serde(default = "default_claude_cache_ttl")]
     claude_cache_ttl_seconds: u64,
+    #[serde(default)]
+    openrouter_api_key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +135,26 @@ struct ClaudeUsageResponse {
 struct UsageWindow {
     utilization: Option<f64>,
     resets_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterKeyResponse {
+    data: OpenRouterKeyData,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterKeyData {
+    label: Option<String>,
+    usage: Option<f64>,
+    limit: Option<f64>,
+    is_free_tier: Option<bool>,
+    rate_limit: Option<OpenRouterRateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterRateLimit {
+    requests: Option<u32>,
+    interval: Option<String>,
 }
 
 fn default_poll_seconds() -> u64 {
@@ -415,6 +437,7 @@ async fn refresh_snapshot() -> Result<AgentsSnapshot> {
         agents: vec![],
         poll_seconds: DEFAULT_POLL_SECONDS,
         claude_cache_ttl_seconds: 60,
+        openrouter_api_key_path: None,
     });
 
     let mut agents = Vec::new();
@@ -474,6 +497,7 @@ async fn collect_agent_status(def: &AgentDefinition, config: &Config) -> AgentSt
         "codex" => collect_codex(&mut status).await,
         "gemini" => collect_gemini(&mut status).await,
         "copilot" => collect_copilot(&mut status).await,
+        "openrouter" => collect_openrouter(&mut status, config).await,
         _ => {
             status.state = AgentState::Installed;
             status.summary = format!("{} installed", def.command);
@@ -696,4 +720,78 @@ async fn collect_copilot(status: &mut AgentStatus) {
         status.details.push(format!("Last user: {u}"));
     }
     status.details.push(format!("Local sessions: {session_count}"));
+}
+
+async fn collect_openrouter(status: &mut AgentStatus, config: &Config) {
+    // Read API key from configured path or default agenix location
+    let api_key_path = config
+        .openrouter_api_key_path
+        .as_deref()
+        .unwrap_or("/run/agenix/openrouter-api-key");
+
+    let api_key = match fs::read_to_string(api_key_path) {
+        Ok(key) => key.trim().to_string(),
+        Err(_) => {
+            status.state = AgentState::Warning;
+            status.summary = "OpenRouter API key not found".to_string();
+            status.details.push(format!("Expected at: {api_key_path}"));
+            return;
+        }
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let response = client
+        .get("https://openrouter.ai/api/v1/auth/key")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await;
+
+    let Ok(resp) = response else {
+        status.state = AgentState::Warning;
+        status.summary = "OpenRouter API unreachable".to_string();
+        return;
+    };
+
+    if !resp.status().is_success() {
+        status.state = AgentState::Warning;
+        status.summary = format!("API error: {}", resp.status());
+        return;
+    }
+
+    let Ok(key_info) = resp.json::<OpenRouterKeyResponse>().await else {
+        status.state = AgentState::Warning;
+        status.summary = "Failed to parse OpenRouter response".to_string();
+        return;
+    };
+
+    let data = &key_info.data;
+    let usage = data.usage.unwrap_or(0.0);
+    let limit = data.limit.unwrap_or(0.0);
+
+    status.state = AgentState::Ready;
+
+    if limit > 0.0 {
+        let remaining = limit - usage;
+        let pct_used = (usage / limit * 100.0).round() as u32;
+        status.summary = format!("${:.2} used / ${:.2} limit ({pct_used}%)", usage, limit);
+        status.details.push(format!("Remaining: ${:.2}", remaining));
+    } else if data.is_free_tier.unwrap_or(false) {
+        status.summary = format!("Free tier - ${:.4} used", usage);
+    } else {
+        status.summary = format!("${:.2} used (no limit)", usage);
+    }
+
+    if let Some(label) = &data.label {
+        status.details.push(format!("Key: {label}"));
+    }
+
+    if let Some(rate_limit) = &data.rate_limit {
+        if let (Some(requests), Some(interval)) = (rate_limit.requests, &rate_limit.interval) {
+            status.details.push(format!("Rate limit: {requests} req/{interval}"));
+        }
+    }
 }
