@@ -19,6 +19,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, process::Stdio, time::Duration};
 use tokio::process::Command;
+use walkdir::WalkDir;
 
 const APP_ID: &str = "com.deepwatrcreatur.CosmicAppletAgentsStatus";
 const CONFIG_ENV: &str = "AGENTS_STATUS_CONFIG";
@@ -203,6 +204,78 @@ struct CopilotEvent {
     #[serde(rename = "type")]
     event_type: String,
     data: Option<serde_json::Value>,
+}
+
+// Claude JSONL message structure for local cost scanning
+#[derive(Debug, Deserialize)]
+struct ClaudeJsonlMessage {
+    #[serde(rename = "type")]
+    msg_type: Option<String>,
+    message: Option<ClaudeMessageContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeMessageContent {
+    usage: Option<ClaudeMessageUsage>,
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeMessageUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+}
+
+// Codex auth structure
+#[derive(Debug, Deserialize)]
+struct CodexAuth {
+    tokens: Option<CodexTokens>,
+    auth_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTokens {
+    access_token: Option<String>,
+}
+
+// Codex WHAM usage response
+#[derive(Debug, Deserialize)]
+struct CodexWhamUsage {
+    #[serde(rename = "rateLimit")]
+    rate_limit: Option<CodexRateLimit>,
+    credits: Option<CodexCredits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimit {
+    #[serde(rename = "fiveHourUtilization")]
+    five_hour_utilization: Option<f64>,
+    #[serde(rename = "weeklyUtilization")]
+    weekly_utilization: Option<f64>,
+    #[serde(rename = "fiveHourResetsAt")]
+    five_hour_resets_at: Option<String>,
+    #[serde(rename = "weeklyResetsAt")]
+    weekly_resets_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexCredits {
+    remaining: Option<f64>,
+    total: Option<f64>,
+}
+
+// OpenRouter credits response
+#[derive(Debug, Deserialize)]
+struct OpenRouterCreditsResponse {
+    data: OpenRouterCreditsData,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterCreditsData {
+    total_credits: Option<f64>,
+    total_usage: Option<f64>,
 }
 
 fn default_poll_seconds() -> u64 {
@@ -736,45 +809,46 @@ fn add_claude_local_stats(status: &mut AgentStatus, stats: &ClaudeStatsCache) {
     const CACHE_WRITE_COST_PER_M: f64 = 18.75;
     const CACHE_READ_COST_PER_M: f64 = 1.50;
 
-    if let Some(model_usage) = &stats.model_usage {
-        let total_input: u64 = model_usage.values()
-            .filter_map(|m| m.input_tokens)
-            .sum();
-        let total_output: u64 = model_usage.values()
-            .filter_map(|m| m.output_tokens)
-            .sum();
-        let total_cache_read: u64 = model_usage.values()
-            .filter_map(|m| m.cache_read_input_tokens)
-            .sum();
-        let total_cache_write: u64 = model_usage.values()
-            .filter_map(|m| m.cache_creation_input_tokens)
-            .sum();
+    let home = dirs::home_dir().unwrap_or_default();
 
-        // Calculate estimated cost
-        let input_cost = total_input as f64 / 1_000_000.0 * INPUT_COST_PER_M;
-        let output_cost = total_output as f64 / 1_000_000.0 * OUTPUT_COST_PER_M;
-        let cache_read_cost = total_cache_read as f64 / 1_000_000.0 * CACHE_READ_COST_PER_M;
-        let cache_write_cost = total_cache_write as f64 / 1_000_000.0 * CACHE_WRITE_COST_PER_M;
-        let total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
+    // Try JSONL scanning first for more accurate data, fall back to stats cache
+    let (total_input, total_output, total_cache_read, total_cache_write) =
+        if let Some((input, output, cache_read, cache_write)) = scan_claude_jsonl_usage(&home) {
+            (input, output, cache_read, cache_write)
+        } else if let Some(model_usage) = &stats.model_usage {
+            let input: u64 = model_usage.values().filter_map(|m| m.input_tokens).sum();
+            let output: u64 = model_usage.values().filter_map(|m| m.output_tokens).sum();
+            let cache_read: u64 = model_usage.values().filter_map(|m| m.cache_read_input_tokens).sum();
+            let cache_write: u64 = model_usage.values().filter_map(|m| m.cache_creation_input_tokens).sum();
+            (input, output, cache_read, cache_write)
+        } else {
+            (0, 0, 0, 0)
+        };
 
-        if total_cost > 0.0 {
-            status.details.push(format!("Est. cost: ~${:.2}", total_cost));
-        }
+    // Calculate estimated cost
+    let input_cost = total_input as f64 / 1_000_000.0 * INPUT_COST_PER_M;
+    let output_cost = total_output as f64 / 1_000_000.0 * OUTPUT_COST_PER_M;
+    let cache_read_cost = total_cache_read as f64 / 1_000_000.0 * CACHE_READ_COST_PER_M;
+    let cache_write_cost = total_cache_write as f64 / 1_000_000.0 * CACHE_WRITE_COST_PER_M;
+    let total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
 
-        if total_input > 0 || total_output > 0 {
-            status.details.push(format!(
-                "Tokens: {}K in / {}K out",
-                total_input / 1000,
-                total_output / 1000
-            ));
-        }
-        if total_cache_read > 0 || total_cache_write > 0 {
-            status.details.push(format!(
-                "Cache: {}M read / {}M write",
-                total_cache_read / 1_000_000,
-                total_cache_write / 1_000_000
-            ));
-        }
+    if total_cost > 0.0 {
+        status.details.push(format!("Est. cost: ~${:.2}", total_cost));
+    }
+
+    if total_input > 0 || total_output > 0 {
+        status.details.push(format!(
+            "Tokens: {}K in / {}K out",
+            total_input / 1000,
+            total_output / 1000
+        ));
+    }
+    if total_cache_read > 0 || total_cache_write > 0 {
+        status.details.push(format!(
+            "Cache: {}M read / {}M write",
+            total_cache_read / 1_000_000,
+            total_cache_write / 1_000_000
+        ));
     }
 
     if let (Some(sessions), Some(messages)) = (stats.total_sessions, stats.total_messages) {
@@ -782,9 +856,54 @@ fn add_claude_local_stats(status: &mut AgentStatus, stats: &ClaudeStatsCache) {
     }
 }
 
+/// Scan Claude project JSONL files for actual per-message token usage
+/// This provides more accurate cost tracking than the stats cache
+fn scan_claude_jsonl_usage(home: &PathBuf) -> Option<(u64, u64, u64, u64)> {
+    let projects_dir = home.join(".claude/projects");
+    if !projects_dir.exists() {
+        return None;
+    }
+
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cache_read = 0u64;
+    let mut total_cache_write = 0u64;
+
+    // Walk through all JSONL files in projects directory
+    for entry in WalkDir::new(&projects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false))
+    {
+        if let Ok(content) = fs::read_to_string(entry.path()) {
+            for line in content.lines() {
+                if let Ok(msg) = serde_json::from_str::<ClaudeJsonlMessage>(line) {
+                    if msg.msg_type.as_deref() == Some("assistant") {
+                        if let Some(message) = &msg.message {
+                            if let Some(usage) = &message.usage {
+                                total_input += usage.input_tokens.unwrap_or(0);
+                                total_output += usage.output_tokens.unwrap_or(0);
+                                total_cache_read += usage.cache_read_input_tokens.unwrap_or(0);
+                                total_cache_write += usage.cache_creation_input_tokens.unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if total_input > 0 || total_output > 0 {
+        Some((total_input, total_output, total_cache_read, total_cache_write))
+    } else {
+        None
+    }
+}
+
 async fn collect_codex(status: &mut AgentStatus) {
     let home = dirs::home_dir().unwrap_or_default();
     let codex_dir = home.join(".codex");
+    let auth_path = codex_dir.join("auth.json");
 
     // Try to get login status
     let login_output = Command::new("codex")
@@ -792,19 +911,80 @@ async fn collect_codex(status: &mut AgentStatus) {
         .output()
         .await;
 
-    let summary = match login_output {
+    let login_summary = match login_output {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            // Prefer stdout, fall back to stderr
             if stdout.is_empty() { stderr } else { stdout }
         }
-        Ok(output) => {
-            // Command ran but failed, check stderr
-            String::from_utf8_lossy(&output.stderr).trim().to_string()
-        }
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
         _ => "Unable to read login status".to_string(),
     };
+
+    let logged_in = login_summary.to_lowercase().contains("logged in");
+
+    // Try WHAM API first if we have an access token
+    let mut api_usage: Option<CodexWhamUsage> = None;
+    if let Ok(auth_content) = fs::read_to_string(&auth_path) {
+        if let Ok(auth) = serde_json::from_str::<CodexAuth>(&auth_content) {
+            if let Some(tokens) = &auth.tokens {
+                if let Some(access_token) = &tokens.access_token {
+                    let client = Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build()
+                        .unwrap();
+
+                    if let Ok(resp) = client
+                        .get("https://chatgpt.com/backend-api/wham/usage")
+                        .header("Authorization", format!("Bearer {access_token}"))
+                        .send()
+                        .await
+                    {
+                        if resp.status().is_success() {
+                            api_usage = resp.json::<CodexWhamUsage>().await.ok();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If API returned rate limits, use those
+    if let Some(usage) = &api_usage {
+        if let Some(rate_limit) = &usage.rate_limit {
+            status.state = AgentState::Ready;
+
+            let five_hour = rate_limit.five_hour_utilization.map(|u| (u * 100.0).round() as u32).unwrap_or(0);
+            let weekly = rate_limit.weekly_utilization.map(|u| (u * 100.0).round() as u32).unwrap_or(0);
+
+            status.summary = format!("5h: {five_hour}% | Week: {weekly}%");
+
+            if let Some(resets_at) = &rate_limit.five_hour_resets_at {
+                if let Some(relative) = format_relative(resets_at) {
+                    status.details.push(format!("5h window resets in {relative}"));
+                }
+                status.metrics.current_resets_at = Some(resets_at.clone());
+            }
+
+            status.metrics.current_utilization = Some(five_hour);
+            status.metrics.weekly_utilization = Some(weekly);
+
+            if let Some(credits) = &usage.credits {
+                if let (Some(remaining), Some(total)) = (credits.remaining, credits.total) {
+                    if total > 0.0 {
+                        status.details.push(format!("Credits: ${:.2} / ${:.2}", remaining, total));
+                    }
+                }
+            }
+
+            // Still add local SQLite data as supplementary info
+            add_codex_local_stats(status, &codex_dir);
+            return;
+        }
+    }
+
+    // Fall back to SQLite-only data
+    status.state = if logged_in { AgentState::Ready } else { AgentState::Warning };
 
     // Query SQLite for usage stats
     let state_db = codex_dir.join("state_5.sqlite");
@@ -815,17 +995,13 @@ async fn collect_codex(status: &mut AgentStatus) {
 
     if state_db.exists() {
         if let Ok(conn) = rusqlite::Connection::open(&state_db) {
-            // Total thread count
             thread_count = conn
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get::<_, i64>(0))
                 .ok();
-
-            // Total tokens across all time
             total_tokens = conn
                 .query_row("SELECT SUM(tokens_used) FROM threads", [], |row| row.get::<_, i64>(0))
                 .ok();
 
-            // Tokens from last 24 hours (timestamps are in seconds)
             let day_ago = chrono::Utc::now().timestamp() - 86400;
             today_tokens = conn
                 .query_row(
@@ -835,7 +1011,6 @@ async fn collect_codex(status: &mut AgentStatus) {
                 )
                 .ok();
 
-            // Tokens from last 7 days
             let week_ago = chrono::Utc::now().timestamp() - 7 * 86400;
             week_tokens = conn
                 .query_row(
@@ -847,31 +1022,21 @@ async fn collect_codex(status: &mut AgentStatus) {
         }
     }
 
-    status.state = if summary.to_lowercase().contains("logged in") {
-        AgentState::Ready
-    } else {
-        AgentState::Warning
-    };
-
-    // Calculate costs - GPT-4o pricing: $2.50/1M input, $10/1M output
-    // Estimate 1:4 input:output ratio, so ~$8.50/1M tokens average
+    // GPT-4o pricing estimate
     let cost_per_million = 8.50;
 
-    // Build enhanced summary with cost estimate
     let total = total_tokens.unwrap_or(0);
     if total > 0 {
         let total_cost = total as f64 / 1_000_000.0 * cost_per_million;
-        let logged_in = summary.to_lowercase().contains("logged in");
         status.summary = format!(
             "{} | ~${:.2} total",
-            if logged_in { "Logged in" } else { &summary },
+            if logged_in { "Logged in" } else { &login_summary },
             total_cost
         );
     } else {
-        status.summary = summary;
+        status.summary = login_summary;
     }
 
-    // Show detailed breakdown
     if let Some(count) = thread_count {
         status.details.push(format!("Sessions: {count}"));
     }
@@ -893,6 +1058,26 @@ async fn collect_codex(status: &mut AgentStatus) {
     if let Some(total) = total_tokens {
         if total > 0 {
             status.details.push(format!("All time: {}M tokens", total / 1_000_000));
+        }
+    }
+}
+
+fn add_codex_local_stats(status: &mut AgentStatus, codex_dir: &PathBuf) {
+    let state_db = codex_dir.join("state_5.sqlite");
+    if !state_db.exists() {
+        return;
+    }
+
+    if let Ok(conn) = rusqlite::Connection::open(&state_db) {
+        if let Ok(count) = conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get::<_, i64>(0)) {
+            status.details.push(format!("Sessions: {count}"));
+        }
+
+        if let Ok(total) = conn.query_row("SELECT SUM(tokens_used) FROM threads", [], |row| row.get::<_, i64>(0)) {
+            if total > 0 {
+                let cost = total as f64 / 1_000_000.0 * 8.50;
+                status.details.push(format!("Local: {}M tokens (~${:.2})", total / 1_000_000, cost));
+            }
         }
     }
 }
