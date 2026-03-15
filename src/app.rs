@@ -531,6 +531,19 @@ async fn collect_claude(status: &mut AgentStatus, _config: &Config) {
         return;
     };
 
+    // Check for rate limiting or other HTTP errors
+    if resp.status() == 429 {
+        status.state = AgentState::Ready;
+        status.summary = "Rate limited - try again later".to_string();
+        return;
+    }
+
+    if !resp.status().is_success() {
+        status.state = AgentState::Warning;
+        status.summary = format!("API error: {}", resp.status());
+        return;
+    }
+
     let Ok(usage) = resp.json::<ClaudeUsageResponse>().await else {
         status.state = AgentState::Warning;
         status.summary = "Failed to parse usage response".to_string();
@@ -585,7 +598,14 @@ async fn collect_codex(status: &mut AgentStatus) {
 
     let summary = match login_output {
         Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            // Prefer stdout, fall back to stderr
+            if stdout.is_empty() { stderr } else { stdout }
+        }
+        Ok(output) => {
+            // Command ran but failed, check stderr
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
         }
         _ => "Unable to read login status".to_string(),
     };
